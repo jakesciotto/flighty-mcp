@@ -108,7 +108,7 @@ SELECT
     f.equipmentManufacturer AS aircraft_manufacturer,
     f.equipmentPlaneName AS aircraft_name,
     f.equipmentCruisingSpeed AS cruising_speed_kmh,
-    f.arrivalWeatherCondition AS arrival_weather,
+    f.arrivalWeatherConditionName AS arrival_weather,
     f.arrivalWeatherTemperature AS arrival_temp_c,
     f.delayForecastDelayMean AS delay_forecast_mean_min,
     f.delayForecastObservations AS delay_forecast_observations,
@@ -512,7 +512,7 @@ def _parse_flight_number(flight_code: str) -> tuple[str, str]:
             f"Invalid flight code '{flight_code}'. "
             "Expected format like 'UA194' or 'BA930'."
         )
-    return m.group(1), code
+    return m.group(1), m.group(2)
 
 
 def _lookup_airline(conn: sqlite3.Connection, iata: str) -> dict[str, Any]:
@@ -619,7 +619,7 @@ def add_flight(
 
     # If airports not provided, try AirLabs API lookup
     if not departure_airport or not arrival_airport:
-        route = _lookup_flight_route(flight_number)
+        route = _lookup_flight_route(airline_iata + flight_number)
         if route:
             departure_airport = departure_airport or route["dep_iata"]
             arrival_airport = arrival_airport or route["arr_iata"]
