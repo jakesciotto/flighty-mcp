@@ -7,6 +7,7 @@ import sqlite3
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 DEFAULT_DB_PATH = os.path.expanduser(
@@ -68,7 +69,32 @@ def _build_flight_dict(row: sqlite3.Row) -> dict[str, Any]:
 # Flight queries
 # ---------------------------------------------------------------------------
 
-_FLIGHT_BASE_QUERY = """
+# Flighty renamed Flight.arrivalWeatherCondition -> arrivalWeatherConditionName
+# in a recent app update. Detect which name the installed schema uses so both
+# old and new databases work. Ordered newest-first.
+_ARRIVAL_WEATHER_CANDIDATES = ("arrivalWeatherConditionName", "arrivalWeatherCondition")
+
+
+@lru_cache(maxsize=1)
+def _arrival_weather_column() -> str:
+    conn = _get_db()
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(Flight)").fetchall()}
+    finally:
+        conn.close()
+    for name in _ARRIVAL_WEATHER_CANDIDATES:
+        if name in cols:
+            return name
+    return _ARRIVAL_WEATHER_CANDIDATES[0]
+
+
+def _flight_base_query() -> str:
+    return _FLIGHT_BASE_QUERY_TEMPLATE.format(
+        arrival_weather_col=_arrival_weather_column()
+    )
+
+
+_FLIGHT_BASE_QUERY_TEMPLATE = """
 SELECT
     f.id,
     f.number AS flight_number,
@@ -108,7 +134,7 @@ SELECT
     f.equipmentManufacturer AS aircraft_manufacturer,
     f.equipmentPlaneName AS aircraft_name,
     f.equipmentCruisingSpeed AS cruising_speed_kmh,
-    f.arrivalWeatherConditionName AS arrival_weather,
+    f.{arrival_weather_col} AS arrival_weather,
     f.arrivalWeatherTemperature AS arrival_temp_c,
     f.delayForecastDelayMean AS delay_forecast_mean_min,
     f.delayForecastObservations AS delay_forecast_observations,
@@ -148,7 +174,7 @@ def list_flights(
     """List the owner's own flights (excludes friends' flights)."""
     conn = _get_db()
     owner_id = _get_owner_user_id(conn)
-    query = _FLIGHT_BASE_QUERY + " AND uf.userId = ?"
+    query = _flight_base_query() + " AND uf.userId = ?"
     params: list[Any] = [owner_id]
 
     if not include_archived:
@@ -181,7 +207,7 @@ def list_friend_flights(
     conn = _get_db()
     owner_id = _get_owner_user_id(conn)
 
-    query = _FLIGHT_BASE_QUERY.replace(
+    query = _flight_base_query().replace(
         "LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId",
         "LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId\n"
         "LEFT JOIN Profile p ON uf.userId = p.userId",
@@ -218,7 +244,7 @@ def list_friend_flights(
 def get_flight(flight_id: str | None = None, flight_number: str | None = None) -> dict[str, Any] | None:
     """Get a specific flight by ID or flight number (returns most recent match)."""
     conn = _get_db()
-    query = _FLIGHT_BASE_QUERY
+    query = _flight_base_query()
 
     if flight_id:
         query += " AND f.id = ?"
@@ -245,7 +271,7 @@ def search_flights(
 ) -> list[dict[str, Any]]:
     """Search flights by airline, airports, or date range."""
     conn = _get_db()
-    query = _FLIGHT_BASE_QUERY
+    query = _flight_base_query()
     params: list[Any] = []
 
     if airline:
