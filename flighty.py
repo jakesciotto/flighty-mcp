@@ -6,9 +6,10 @@ import re
 import sqlite3
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from functools import lru_cache
 from typing import Any
+from zoneinfo import ZoneInfo
 
 DEFAULT_DB_PATH = os.path.expanduser(
     "~/Library/Containers/com.flightyapp.flighty/Data/Documents/MainFlightyDatabase.db"
@@ -553,12 +554,29 @@ def _lookup_airline(conn: sqlite3.Connection, iata: str) -> dict[str, Any]:
 
 def _lookup_airport(conn: sqlite3.Connection, code: str) -> dict[str, Any]:
     row = conn.execute(
-        "SELECT id, iata, name FROM Airport WHERE UPPER(iata) = ? AND deleted IS NULL LIMIT 1",
+        "SELECT id, iata, name, timeZoneIdentifier FROM Airport WHERE UPPER(iata) = ? AND deleted IS NULL LIMIT 1",
         [code.upper()],
     ).fetchone()
     if not row:
         raise ValueError(f"Airport with IATA code '{code}' not found in Flighty database.")
     return dict(row)
+
+
+def _airport_timezone(airport: dict[str, Any]) -> tzinfo:
+    """Return an airport's local timezone from its IANA identifier.
+
+    Flighty's Airport table stores an IANA ``timeZoneIdentifier`` (e.g.
+    ``'America/New_York'``). Flight times must be interpreted in the airport's
+    own zone so they are stored as the correct UTC instant regardless of where
+    this server runs. Falls back to UTC if the identifier is missing or unknown.
+    """
+    tz_id = airport.get("timeZoneIdentifier")
+    if tz_id:
+        try:
+            return ZoneInfo(tz_id)
+        except Exception:
+            pass
+    return timezone.utc
 
 
 def _get_owner_user_id(conn: sqlite3.Connection) -> str:
@@ -632,8 +650,8 @@ def add_flight(
         date: Departure date in YYYY-MM-DD format.
         departure_airport: Departure airport IATA code (e.g. 'SFO'). If omitted, looked up via AirLabs API.
         arrival_airport: Arrival airport IATA code (e.g. 'LHR'). If omitted, looked up via AirLabs API.
-        departure_time: Optional departure time in HH:MM format (24h, local time). Defaults to '00:00'.
-        arrival_time: Optional arrival time in HH:MM format (24h, local time). Defaults to departure + 3h.
+        departure_time: Optional departure time in HH:MM format (24h, departure airport local time). Defaults to '00:00'.
+        arrival_time: Optional arrival time in HH:MM format (24h, arrival airport local time). Defaults to departure + 3h.
         seat_number: Optional seat number (e.g. '12A').
         cabin_class: Optional cabin class (e.g. 'economy', 'business', 'first').
         booking_reference: Optional PNR/booking reference.
@@ -673,17 +691,25 @@ def add_flight(
         arr_airport = _lookup_airport(conn, arrival_airport)
         user_id = _get_owner_user_id(conn)
 
-        # Parse departure datetime
+        # Parse departure datetime in the departure airport's local timezone.
+        # Times are entered as local wall-clock times, so they must be localized
+        # before converting to a Unix timestamp; a naive .timestamp() would
+        # instead assume this machine's timezone and store the wrong instant.
         dep_time = departure_time or "00:00"
-        dep_dt = datetime.fromisoformat(f"{date}T{dep_time}:00")
+        dep_dt = datetime.fromisoformat(f"{date}T{dep_time}:00").replace(
+            tzinfo=_airport_timezone(dep_airport)
+        )
         dep_ts = int(dep_dt.timestamp())
 
-        # Parse or estimate arrival datetime
+        # Parse or estimate arrival datetime in the arrival airport's timezone.
         if arrival_time:
-            arr_dt = datetime.fromisoformat(f"{date}T{arrival_time}:00")
-            # If arrival is before departure, assume next day
+            arr_dt = datetime.fromisoformat(f"{date}T{arrival_time}:00").replace(
+                tzinfo=_airport_timezone(arr_airport)
+            )
+            # If arrival is before departure, assume next day. Both datetimes are
+            # timezone-aware, so this compares actual instants and stays correct
+            # across timezones (e.g. westbound flights arriving the "same" clock time).
             if arr_dt <= dep_dt:
-                from datetime import timedelta
                 arr_dt += timedelta(days=1)
             arr_ts = int(arr_dt.timestamp())
         else:
