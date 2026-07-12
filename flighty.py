@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sqlite3
+import sys
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -563,28 +565,69 @@ def _get_owner_user_id(conn: sqlite3.Connection) -> str:
     return row[0]
 
 
+class AirLabsError(RuntimeError):
+    """Raised when an AirLabs route lookup was attempted but failed.
+
+    Distinct from returning ``None`` (no key configured, or AirLabs simply has
+    no route for the flight) so callers can tell a misconfiguration apart from
+    an unconfigured feature.
+    """
+
+
 def _lookup_flight_route(flight_iata: str) -> dict[str, str] | None:
     """Look up flight route info from AirLabs API.
 
-    Returns dict with dep_iata, arr_iata, dep_time, arr_time or None on failure.
+    Returns a dict with dep_iata, arr_iata, dep_time, arr_time on success, or
+    None when no API key is configured or AirLabs has no route for the flight.
+
+    Raises:
+        AirLabsError: if the lookup was attempted but failed (bad/expired key,
+            rate limit, network error, or a malformed response). The message
+            describes the cause so callers can surface it instead of a generic
+            "set the API key" hint.
     """
     if not AIRLABS_API_KEY:
         return None
+
+    url = f"https://airlabs.co/api/v9/flight?flight_iata={flight_iata}&api_key={AIRLABS_API_KEY}"
+    req = urllib.request.Request(url, headers={"User-Agent": "flighty-mcp/1.0"})
     try:
-        url = f"https://airlabs.co/api/v9/flight?flight_iata={flight_iata}&api_key={AIRLABS_API_KEY}"
-        req = urllib.request.Request(url, headers={"User-Agent": "flighty-mcp/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        r = data.get("response")
-        if r and r.get("dep_iata") and r.get("arr_iata"):
-            return {
-                "dep_iata": r["dep_iata"],
-                "arr_iata": r["arr_iata"],
-                "dep_time": r.get("dep_time"),
-                "arr_time": r.get("arr_time"),
-            }
-    except Exception:
-        pass
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        raise AirLabsError(f"AirLabs API returned HTTP {e.code} ({e.reason})") from e
+    except urllib.error.URLError as e:
+        raise AirLabsError(f"AirLabs API is unreachable ({e.reason})") from e
+    except Exception as e:  # timeouts, socket errors, etc.
+        raise AirLabsError(f"AirLabs API request failed ({e})") from e
+
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError) as e:
+        raise AirLabsError("AirLabs API returned a non-JSON response") from e
+
+    # AirLabs returns HTTP 200 with an {"error": {...}} body for bad/expired
+    # keys and rate limits, so inspect the payload rather than the status code.
+    error = data.get("error") if isinstance(data, dict) else None
+    if error:
+        if isinstance(error, dict):
+            message = error.get("message") or "unknown error"
+            code = error.get("code") or error.get("key")
+            detail = f"{message} ({code})" if code else message
+        else:
+            detail = str(error)
+        raise AirLabsError(f"AirLabs API error: {detail}")
+
+    r = data.get("response") if isinstance(data, dict) else None
+    if r and r.get("dep_iata") and r.get("arr_iata"):
+        return {
+            "dep_iata": r["dep_iata"],
+            "arr_iata": r["arr_iata"],
+            "dep_time": r.get("dep_time"),
+            "arr_time": r.get("arr_time"),
+        }
+
+    # Reached AirLabs successfully, but it has no usable route for this flight.
     return None
 
 
@@ -619,7 +662,13 @@ def add_flight(
 
     # If airports not provided, try AirLabs API lookup
     if not departure_airport or not arrival_airport:
-        route = _lookup_flight_route(flight_number)
+        lookup_error: str | None = None
+        route: dict[str, str] | None = None
+        try:
+            route = _lookup_flight_route(flight_number)
+        except AirLabsError as e:
+            lookup_error = str(e)
+            print(f"flighty-mcp: {lookup_error}", file=sys.stderr)
         if route:
             departure_airport = departure_airport or route["dep_iata"]
             arrival_airport = arrival_airport or route["arr_iata"]
@@ -635,9 +684,19 @@ def add_flight(
                 except (IndexError, TypeError):
                     pass
         if not departure_airport or not arrival_airport:
+            if lookup_error:
+                raise ValueError(
+                    f"{lookup_error}. Provide departure_airport and arrival_airport "
+                    "manually, or verify your AIRLABS_API_KEY."
+                )
+            if not AIRLABS_API_KEY:
+                raise ValueError(
+                    "Could not determine airports. Provide departure_airport and arrival_airport, "
+                    "or set the AIRLABS_API_KEY environment variable for automatic lookup."
+                )
             raise ValueError(
-                "Could not determine airports. Provide departure_airport and arrival_airport, "
-                "or set the AIRLABS_API_KEY environment variable for automatic lookup."
+                f"AirLabs has no route data for {flight_code}. "
+                "Provide departure_airport and arrival_airport manually."
             )
 
     conn = _get_db(readonly=False)
