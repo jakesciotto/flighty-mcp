@@ -189,8 +189,8 @@ def add_flight(
         date: Departure date in YYYY-MM-DD format (e.g. "2026-04-15").
         departure_airport: Departure airport IATA code (e.g. "SFO"). Auto-looked up if omitted.
         arrival_airport: Arrival airport IATA code (e.g. "LHR"). Auto-looked up if omitted.
-        departure_time: Optional departure time in HH:MM 24h format, local time (e.g. "14:30"). Defaults to midnight.
-        arrival_time: Optional arrival time in HH:MM 24h format, local time (e.g. "22:15"). Defaults to 3h after departure.
+        departure_time: Optional departure time in HH:MM 24h format, in the departure airport's local time (e.g. "14:30"). Defaults to midnight.
+        arrival_time: Optional arrival time in HH:MM 24h format, in the arrival airport's local time (e.g. "22:15"). Defaults to 3h after departure.
         seat_number: Optional seat number (e.g. "12A").
         cabin_class: Optional cabin class (e.g. "economy", "business", "first").
         booking_reference: Optional PNR/booking reference code.
